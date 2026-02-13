@@ -401,6 +401,9 @@ func (w *Writer) WriteTfdt(baseMediaDecodeTime uint64) {
 		w.StartFullBox(TypeTfdt, 0, 0)
 		w.putUint32(uint32(baseMediaDecodeTime))
 	}
+	// TODO: maybe always use version 1 (64-bit)?
+	// w.StartFullBox(TypeTfdt, 1, 0)
+	// w.putUint64(baseMediaDecodeTime)
 	w.EndBox()
 }
 
