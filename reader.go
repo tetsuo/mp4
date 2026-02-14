@@ -1,4 +1,4 @@
-package isobmff
+package bmff
 
 // maxDepth limits the reader/writer nesting stack.
 const maxDepth = 16

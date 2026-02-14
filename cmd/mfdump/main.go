@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	mf "github.com/tetsuo/isobmff"
+	mf "github.com/tetsuo/bmff"
 )
 
 func main() {

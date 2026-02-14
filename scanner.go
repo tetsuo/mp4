@@ -1,4 +1,4 @@
-package isobmff
+package bmff
 
 import "io"
 
@@ -23,13 +23,13 @@ func (e ScanEntry) DataSize() int64 {
 // Typical usage:
 //
 //	f, _ := os.Open("video.mp4")
-//	sc := isobmff.NewScanner(f)
+//	sc := bmff.NewScanner(f)
 //	for sc.Next() {
 //	    e := sc.Entry()
-//	    if e.Type == isobmff.TypeMoov {
+//	    if e.Type == bmff.TypeMoov {
 //	        buf := make([]byte, e.DataSize())
 //	        sc.ReadBody(buf)
-//	        r := isobmff.NewReader(buf)
+//	        r := bmff.NewReader(buf)
 //	        // parse moov contents...
 //	    }
 //	}

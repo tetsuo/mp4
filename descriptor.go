@@ -1,4 +1,4 @@
-package isobmff
+package bmff
 
 import "strconv"
 

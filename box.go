@@ -1,5 +1,5 @@
-// Package isobmff implements encoding and decoding of ISO Base Media File Format (ISOBMFF) boxes.
-package isobmff
+// Package bmff implements encoding and decoding of ISO Base Media File Format (ISOBMFF) boxes.
+package bmff
 
 // BoxType is a 4-byte box type identifier.
 type BoxType [4]byte

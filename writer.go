@@ -1,4 +1,4 @@
-package isobmff
+package bmff
 
 // writerFrame tracks the start offset of a box for size backpatching.
 type writerFrame struct {
