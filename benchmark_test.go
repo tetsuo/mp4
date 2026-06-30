@@ -17,10 +17,24 @@ func loadTestFile(b *testing.B) []byte {
 	return data
 }
 
+// metaSize returns the combined size of the top-level moov and moof boxes.
+func metaSize(data []byte) int64 {
+	var n int64
+	r := mp4.NewReader(data)
+	for r.Next() {
+		if t := r.Type(); t == mp4.TypeMoov || t == mp4.TypeMoof {
+			n += int64(r.Size())
+		}
+	}
+	return n
+}
+
 func BenchmarkReaderParse(b *testing.B) {
 	data := loadTestFile(b)
 
-	b.SetBytes(int64(len(data)))
+	// The reader skips the mdat payload, so throughput is measured over the
+	// moov/moof bytes rather than the whole file.
+	b.SetBytes(metaSize(data))
 
 	for b.Loop() {
 		r := mp4.NewReader(data)
@@ -87,6 +101,8 @@ func BenchmarkStszIter(b *testing.B) {
 		b.Skip("no stsz found")
 	}
 
+	b.SetBytes(int64(len(stszData)))
+
 	for b.Loop() {
 		it := mp4.NewStszIter(stszData)
 		for {
@@ -100,7 +116,6 @@ func BenchmarkStszIter(b *testing.B) {
 
 func BenchmarkWriterBuild(b *testing.B) {
 	buf := make([]byte, 4096)
-	b.ResetTimer()
 
 	for b.Loop() {
 		w := mp4.NewWriter(buf)
@@ -129,25 +144,32 @@ func BenchmarkWriterBuild(b *testing.B) {
 
 func BenchmarkScannerParse(b *testing.B) {
 	path := "video-media-samples/big-buck-bunny-480p-30sec.mp4"
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		b.Skipf("test file not available: %v", err)
 	}
-	b.SetBytes(info.Size())
-	f, err := os.Open(path)
-	if err != nil {
+	defer f.Close()
+
+	// The loop reads only moov/moof bodies; total their size for SetBytes.
+	sc := mp4.NewScanner(f)
+	var metaBytes int64
+	for sc.Next() {
+		if t := sc.Entry().Type; t == mp4.TypeMoov || t == mp4.TypeMoof {
+			metaBytes += sc.Entry().Size
+		}
+	}
+	if err := sc.Err(); err != nil {
 		b.Fatal(err)
 	}
-	defer f.Close()
+	b.SetBytes(metaBytes)
 
 	var buf []byte
 
 	for b.Loop() {
-		_, err := f.Seek(0, io.SeekStart)
-		if err != nil {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			b.Fatal(err)
 		}
-		sc := mp4.NewScanner(f)
+		sc.Reset(f)
 		for sc.Next() {
 			e := sc.Entry()
 			if e.Type == mp4.TypeMoov || e.Type == mp4.TypeMoof {

@@ -52,6 +52,12 @@ func NewScanner(rs io.ReadSeeker) Scanner {
 	return Scanner{rs: rs}
 }
 
+// Reset discards all state and prepares the Scanner to read from rs. It lets a
+// single Scanner be reused for multiple streams without reallocating.
+func (s *Scanner) Reset(rs io.ReadSeeker) {
+	*s = Scanner{rs: rs}
+}
+
 // Next advances to the next top-level box. Returns false when there
 // are no more boxes or an error occurs. Check Err() after the loop.
 func (s *Scanner) Next() bool {
