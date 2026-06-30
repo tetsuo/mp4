@@ -400,8 +400,15 @@ func ParseTracksInto(dst []*Track, moovBuf []byte) ([]*Track, uint64, error) {
 	}
 	mr.Exit()
 
-	// Parse samples for all tracks; filter out those that fail
+	// Parse samples for each track, dropping any that fail. The result reuses
+	// dst's backing array when it fits, so repeated same-shape parses don't
+	// allocate; overwriting in place is safe as kept tracks only move earlier.
 	var valid []*Track
+	if cap(dst) >= len(tracks) {
+		valid = dst[:0]
+	} else {
+		valid = make([]*Track, 0, len(tracks))
+	}
 	for _, t := range tracks {
 		if err := t.parseSamples(); err != nil {
 			continue
