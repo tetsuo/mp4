@@ -98,6 +98,11 @@ func (w *Writer) putBytes(p []byte) {
 	w.pos += len(p)
 }
 
+func (w *Writer) putString(s string) {
+	copy(w.buf[w.pos:], s)
+	w.pos += len(s)
+}
+
 // putFixedString writes a fixed-length string field with null padding.
 func (w *Writer) putFixedString(s string, length int) {
 	n := copy(w.buf[w.pos:w.pos+length], s)
@@ -246,7 +251,7 @@ func (w *Writer) WriteHdlr(handlerType [4]byte, name string) {
 	w.putUint32(0) // predefined
 	w.putBytes(handlerType[:])
 	w.putZeros(12) // reserved
-	w.putBytes([]byte(name))
+	w.putString(name)
 	w.putUint8(0) // null terminator
 	w.EndBox()
 }
@@ -415,9 +420,20 @@ func (w *Writer) WriteMfhd(sequenceNumber uint32) {
 }
 
 // WriteTfhd writes a complete tfhd box.
-func (w *Writer) WriteTfhd(flags uint32, trackId uint32) {
+// WriteTfhd writes a track fragment header. Default sample duration, size, and
+// flags are written when their corresponding flag bits are set.
+func (w *Writer) WriteTfhd(flags, trackId, defaultDuration, defaultSize, defaultFlags uint32) {
 	w.StartFullBox(TypeTfhd, 0, flags)
 	w.putUint32(trackId)
+	if flags&TfhdDefaultSampleDurationPresent != 0 {
+		w.putUint32(defaultDuration)
+	}
+	if flags&TfhdDefaultSampleSizePresent != 0 {
+		w.putUint32(defaultSize)
+	}
+	if flags&TfhdDefaultSampleFlagsPresent != 0 {
+		w.putUint32(defaultFlags)
+	}
 	w.EndBox()
 }
 
@@ -434,11 +450,16 @@ func (w *Writer) WriteTfdt(baseMediaDecodeTime uint64) {
 }
 
 // WriteTrun writes a complete trun box.
-func (w *Writer) WriteTrun(flags uint32, dataOffset int32, entries []TrunEntry) {
+// WriteTrun writes a track run. firstSampleFlags is written when
+// TrunFirstSampleFlagsPresent is set, overriding the default for sample one.
+func (w *Writer) WriteTrun(flags uint32, dataOffset int32, firstSampleFlags uint32, entries []TrunEntry) {
 	w.StartFullBox(TypeTrun, 0, flags)
 	w.putUint32(uint32(len(entries)))
 	if flags&TrunDataOffsetPresent != 0 {
 		w.putInt32(dataOffset)
+	}
+	if flags&TrunFirstSampleFlagsPresent != 0 {
+		w.putUint32(firstSampleFlags)
 	}
 	for _, e := range entries {
 		if flags&TrunSampleDurationPresent != 0 {
