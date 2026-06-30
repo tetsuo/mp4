@@ -7,11 +7,12 @@ import (
 	"github.com/tetsuo/mp4"
 )
 
-// TrackKind distinguishes video and audio tracks.
+// TrackKind classifies a track as video, audio, or unknown.
 type TrackKind int
 
 const (
-	TrackVideo TrackKind = iota
+	TrackUnknown TrackKind = iota
+	TrackVideo
 	TrackAudio
 )
 
@@ -29,6 +30,9 @@ type trackRaw struct {
 	mdhdVersion uint8
 	hasVmhd     bool
 	hasDinf     bool
+
+	elstMediaTime int64 // edit list media time (media timescale)
+	hasElst       bool
 
 	// Raw sample table data.
 	stszData    []byte
@@ -62,12 +66,11 @@ type Track struct {
 	Samples       []Sample
 	SampleDescIdx uint32
 
-	codec string // set once after parsing completes
-	raw   trackRaw
+	raw trackRaw
 }
 
 // Codec returns the MIME codec string (e.g. "avc1.64001e", "mp4a.40.2").
-func (t *Track) Codec() string { return t.codec }
+func (t *Track) Codec() string { return string(t.raw.codecBuf[:t.raw.codecLen]) }
 
 // StsdRaw returns the raw stsd box data (entire box including header).
 func (t *Track) StsdRaw() []byte { return t.raw.stsd }
@@ -99,6 +102,13 @@ func (t *Track) HasVmhd() bool { return t.raw.hasVmhd }
 // HasDinf returns true if the track has a dinf box (data information).
 func (t *Track) HasDinf() bool { return t.raw.hasDinf }
 
+// EditMediaTime returns the media time of the track's edit list and whether the
+// track has one. It reproduces the initial composition offset, so the first
+// frame is presented at time zero.
+func (t *Track) EditMediaTime() (int64, bool) {
+	return t.raw.elstMediaTime, t.raw.hasElst
+}
+
 // FindTrack returns the track with the given ID, or nil.
 func FindTrack(tracks []*Track, id uint32) *Track {
 	for _, t := range tracks {
@@ -129,6 +139,42 @@ func (t *Track) appendAvcCProfile(profile, compat, level byte) {
 	t.raw.codecBuf[i+4] = hexChars[level>>4]
 	t.raw.codecBuf[i+5] = hexChars[level&0x0f]
 	t.raw.codecLen += 6
+}
+
+// appendAv1CProfile appends ".P.LLT.DD" to the codec buffer from av1C record
+// data: seq_profile, 2-digit seq_level_idx, tier (M or H), and bit depth.
+func (t *Track) appendAv1CProfile(d []byte) {
+	seqProfile := d[1] >> 5
+	seqLevelIdx := d[1] & 0x1f
+	seqTier := d[2] >> 7
+	highBitdepth := (d[2] >> 6) & 0x01
+	twelveBit := (d[2] >> 5) & 0x01
+
+	bitDepth := byte(8)
+	if highBitdepth == 1 {
+		if seqProfile == 2 && twelveBit == 1 {
+			bitDepth = 12
+		} else {
+			bitDepth = 10
+		}
+	}
+	tier := byte('M')
+	if seqTier == 1 {
+		tier = 'H'
+	}
+
+	i := t.raw.codecLen
+	b := t.raw.codecBuf[:]
+	b[i+0] = '.'
+	b[i+1] = '0' + seqProfile
+	b[i+2] = '.'
+	b[i+3] = '0' + seqLevelIdx/10
+	b[i+4] = '0' + seqLevelIdx%10
+	b[i+5] = tier
+	b[i+6] = '.'
+	b[i+7] = '0' + bitDepth/10
+	b[i+8] = '0' + bitDepth%10
+	t.raw.codecLen += 9
 }
 
 // appendEsdsCodec appends ".OTI.audioConfig" to the codec buffer from esds data.
@@ -219,16 +265,26 @@ func skipDescLen(data []byte, ptr, end int) int {
 	return -1
 }
 
-// Sample represents a single media sample.
+// Sample represents a single media sample. The sync-sample flag is stored in
+// the high bit of the size field, which keeps the struct at 32 bytes. Read the
+// size and the flag through the Size and IsSync methods.
 type Sample struct {
-	TrackID            uint32
 	Offset             int64
-	Size               uint32
-	Duration           uint32
 	DTS                int64
+	TrackID            uint32
+	size               uint32
+	Duration           uint32
 	PresentationOffset int32
-	IsSync             bool
 }
+
+// syncBit marks a sync sample in the high bit of Sample.size.
+const syncBit uint32 = 1 << 31
+
+// Size returns the sample size in bytes.
+func (s Sample) Size() uint32 { return s.size &^ syncBit }
+
+// IsSync reports whether the sample is a sync sample (keyframe).
+func (s Sample) IsSync() bool { return s.size&syncBit != 0 }
 
 // PTS returns the presentation timestamp.
 func (s Sample) PTS() int64 {
@@ -305,6 +361,14 @@ var (
 // Returns an error if the moov box is not found, if no playable tracks are
 // found, or if sample tables cannot be parsed for any track.
 func ParseTracks(moovBuf []byte) ([]*Track, uint64, error) {
+	return ParseTracksInto(nil, moovBuf)
+}
+
+// ParseTracksInto behaves like ParseTracks but reuses the Track structs in dst
+// and their sample slices, which avoids most allocations when the new file has
+// the same shape as the previous one. Pass the slice returned by an earlier
+// call as dst. The tracks in dst must not be used after this call.
+func ParseTracksInto(dst []*Track, moovBuf []byte) ([]*Track, uint64, error) {
 	mr := mp4.NewReader(moovBuf)
 	if !mr.Next() || mr.Type() != mp4.TypeMoov {
 		return nil, 0, ErrMoovNotFound
@@ -312,6 +376,7 @@ func ParseTracks(moovBuf []byte) ([]*Track, uint64, error) {
 
 	var tracks []*Track
 	var duration uint64
+	reused := 0
 
 	mr.Enter()
 	for mr.Next() {
@@ -320,9 +385,16 @@ func ParseTracks(moovBuf []byte) ([]*Track, uint64, error) {
 			_, dur, _ := mr.ReadMvhd()
 			duration = dur
 		case mp4.TypeTrak:
-			track := parseTrak(&mr)
-			if track != nil {
-				tracks = append(tracks, track)
+			var t *Track
+			if reused < len(dst) {
+				t = dst[reused]
+				resetTrack(t)
+			} else {
+				t = &Track{}
+			}
+			reused++
+			if parseTrakInto(&mr, t) {
+				tracks = append(tracks, t)
 			}
 		}
 	}
@@ -340,9 +412,17 @@ func ParseTracks(moovBuf []byte) ([]*Track, uint64, error) {
 	return valid, duration, nil
 }
 
-func parseTrak(mr *mp4.Reader) *Track {
-	track := &Track{}
+// resetTrack clears t for reuse while keeping the backing array of its sample
+// slice, so a later parse can refill it without allocating.
+func resetTrack(t *Track) {
+	samples := t.Samples[:0]
+	*t = Track{}
+	t.Samples = samples
+}
 
+// parseTrakInto fills track from a trak box and reports whether it is a valid,
+// playable track.
+func parseTrakInto(mr *mp4.Reader, track *Track) bool {
 	mr.Enter()
 	defer mr.Exit()
 
@@ -356,19 +436,30 @@ func parseTrak(mr *mp4.Reader) *Track {
 			track.ID = trackId
 			track.Width = uint16(w >> 16)
 			track.Height = uint16(h >> 16)
+		case mp4.TypeEdts:
+			parseEdts(mr, track)
 		case mp4.TypeMdia:
 			parseMdia(mr, track)
 		}
 	}
 
-	if track.ID == 0 || track.raw.codecLen == 0 {
-		return nil
+	return track.ID != 0 && track.raw.codecLen != 0
+}
+
+// parseEdts reads the first edit list entry's media time, used to reproduce the
+// initial composition offset in the output's init segment.
+func parseEdts(mr *mp4.Reader, track *Track) {
+	mr.Enter()
+	defer mr.Exit()
+	for mr.Next() {
+		if mr.Type() == mp4.TypeElst {
+			if mt, ok := mr.ReadElst(); ok {
+				track.raw.elstMediaTime = mt
+				track.raw.hasElst = true
+			}
+			return
+		}
 	}
-
-	// Finalize codec string
-	track.codec = string(track.raw.codecBuf[:track.raw.codecLen])
-
-	return track
 }
 
 func parseMdia(mr *mp4.Reader, track *Track) {
@@ -462,67 +553,81 @@ func parseStsd(mr *mp4.Reader, track *Track, handlerType [4]byte) {
 	}
 
 	mr.Enter()
+	defer mr.Exit()
 	mr.Skip(4)
 
 	if !mr.Next() {
-		mr.Exit()
 		return
 	}
 
 	entryType := mr.Type()
 	entryData := mr.Data()
 
-	if handlerType == htVide && entryType == mp4.TypeAvc1 {
+	switch handlerType {
+	case htVide:
 		track.Kind = TrackVideo
-		track.setCodec("avc1")
-		if len(entryData) >= 78 {
-			v := mp4.ReadVisualSampleEntry(entryData)
-			track.Width = v.Width
-			track.Height = v.Height
-
-			mr.Enter()
-			mr.Skip(v.ChildOffset)
-			for mr.Next() {
-				if mr.Type() == mp4.TypeAvcC {
-					d := mr.Data()
-					if len(d) >= 4 {
-						track.appendCodec(".")
-						track.appendAvcCProfile(d[1], d[2], d[3])
-					}
-					break
-				}
-			}
-			mr.Exit()
+		if len(entryData) < 78 {
+			track.setCodec(entryType.String())
+			return
 		}
-	} else if handlerType == htSoun && entryType == mp4.TypeMp4a {
+		v := mp4.ReadVisualSampleEntry(entryData)
+		track.Width = v.Width
+		track.Height = v.Height
+		switch entryType {
+		case mp4.TypeAvc1:
+			track.setCodec("avc1")
+			if d := childBox(mr, v.ChildOffset, mp4.TypeAvcC); len(d) >= 4 {
+				track.appendCodec(".")
+				track.appendAvcCProfile(d[1], d[2], d[3])
+			}
+		case mp4.TypeAv01:
+			track.setCodec("av01")
+			if d := childBox(mr, v.ChildOffset, mp4.TypeAv1C); len(d) >= 3 {
+				track.appendAv1CProfile(d)
+			}
+		default:
+			track.setCodec(entryType.String())
+		}
+	case htSoun:
 		track.Kind = TrackAudio
-		track.setCodec("mp4a")
-		if len(entryData) >= 28 {
-			a := mp4.ReadAudioSampleEntry(entryData)
-			track.ChannelCount = a.ChannelCount
-			track.SampleRate = a.SampleRate >> 16
-
-			mr.Enter()
-			mr.Skip(a.ChildOffset)
-			for mr.Next() {
-				if mr.Type() == mp4.TypeEsds {
-					track.appendEsdsCodec(mr.Data())
-					break
+		switch entryType {
+		case mp4.TypeMp4a:
+			track.setCodec("mp4a")
+			if len(entryData) >= 28 {
+				a := mp4.ReadAudioSampleEntry(entryData)
+				track.ChannelCount = a.ChannelCount
+				track.SampleRate = a.SampleRate >> 16
+				if d := childBox(mr, a.ChildOffset, mp4.TypeEsds); d != nil {
+					track.appendEsdsCodec(d)
 				}
 			}
-			mr.Exit()
+		default:
+			track.setCodec(entryType.String())
+		}
+	default:
+		track.Kind = TrackUnknown
+		track.setCodec(entryType.String())
+	}
+}
+
+// childBox enters the current sample entry, skips its fixed header of
+// childOffset bytes, and returns the data of the first child box of boxType, or
+// nil if none is found.
+func childBox(mr *mp4.Reader, childOffset int, boxType mp4.BoxType) []byte {
+	mr.Enter()
+	defer mr.Exit()
+	mr.Skip(childOffset)
+	for mr.Next() {
+		if mr.Type() == boxType {
+			return mr.Data()
 		}
 	}
-
-	mr.Exit()
+	return nil
 }
 
 // parseSamples parses sample table data and populates track.Samples.
 // Returns an error if required sample table data is missing or corrupt.
 func (t *Track) parseSamples() error {
-	if t.Samples != nil {
-		return nil // already parsed
-	}
 	if t.raw.stszData == nil || t.raw.sttsData == nil || t.raw.stscData == nil {
 		return fmt.Errorf("track %d: %w: missing required sample table data (stsz/stts/stsc)", t.ID, ErrInvalidTrack)
 	}
@@ -533,11 +638,16 @@ func (t *Track) parseSamples() error {
 	stszIt := mp4.NewStszIter(t.raw.stszData)
 	numSamples := int(stszIt.Count())
 	if numSamples == 0 {
-		t.Samples = []Sample{}
+		t.Samples = t.Samples[:0]
 		return nil
 	}
 
-	samples := make([]Sample, numSamples)
+	var samples []Sample
+	if cap(t.Samples) >= numSamples {
+		samples = t.Samples[:numSamples]
+	} else {
+		samples = make([]Sample, numSamples)
+	}
 
 	stscIt := mp4.NewStscIter(t.raw.stscData)
 	sttsIt := mp4.NewSttsIter(t.raw.sttsData)
@@ -627,14 +737,17 @@ func (t *Track) parseSamples() error {
 			isSync = haveSync && nextSync == uint32(i+1)
 		}
 
+		packedSize := size
+		if isSync {
+			packedSize |= syncBit
+		}
 		samples[i] = Sample{
-			TrackID:            t.ID,
 			Offset:             offsetInChunk + chunkOffset,
-			Size:               size,
-			Duration:           curStts.Duration,
 			DTS:                dts,
+			TrackID:            t.ID,
+			size:               packedSize,
+			Duration:           curStts.Duration,
 			PresentationOffset: presOff,
-			IsSync:             isSync,
 		}
 
 		if i+1 >= numSamples {

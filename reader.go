@@ -312,6 +312,25 @@ func (r *Reader) ReadMehd() (fragmentDuration uint64) {
 	return
 }
 
+// ReadElst extracts the media time of the first edit list entry, in the media
+// timescale. It returns the media time and whether an entry was present.
+func (r *Reader) ReadElst() (mediaTime int64, ok bool) {
+	data := r.Data()
+	if len(data) < 4 || be.Uint32(data[0:4]) == 0 {
+		return 0, false
+	}
+	if r.version == 1 {
+		if len(data) < 20 {
+			return 0, false
+		}
+		return int64(be.Uint64(data[12:20])), true
+	}
+	if len(data) < 16 {
+		return 0, false
+	}
+	return int64(int32(be.Uint32(data[8:12]))), true
+}
+
 // ReadTrex extracts fields from a trex box.
 // Returns trackId, default sample description index, default sample duration,
 // default sample size, and default sample flags.
