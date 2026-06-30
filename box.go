@@ -95,6 +95,8 @@ var (
 var (
 	TypeAvc1 = BoxType{'a', 'v', 'c', '1'} // AVC/H.264 visual sample entry
 	TypeAvcC = BoxType{'a', 'v', 'c', 'C'} // AVC decoder configuration record
+	TypeAv01 = BoxType{'a', 'v', '0', '1'} // AV1 visual sample entry
+	TypeAv1C = BoxType{'a', 'v', '1', 'C'} // AV1 codec configuration record
 	TypeBtrt = BoxType{'b', 't', 'r', 't'} // MPEG-4 bit rate
 	TypePasp = BoxType{'p', 'a', 's', 'p'} // Pixel aspect ratio
 	TypeMp4a = BoxType{'m', 'p', '4', 'a'} // MPEG-4 audio sample entry
