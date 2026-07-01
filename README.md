@@ -135,3 +135,22 @@ The [cmd](./cmd) directory contains small programs built on these packages:
 - `mp4dump` prints the box structure of a file as text or JSON.
 - `mp4probe` displays track and fragment information.
 - `mp4remux` remuxes a file into fragmented MP4.
+
+## Performance
+
+```
+goos: darwin
+goarch: arm64
+pkg: github.com/tetsuo/mp4
+cpu: Apple M4 Pro
+BenchmarkReaderParse
+BenchmarkReaderParse-12        3547731        317.4 ns/op    58353.33 MB/s        0 B/op        0 allocs/op
+BenchmarkStszIter
+BenchmarkStszIter-12            897819       1230.0 ns/op     2348.81 MB/s        0 B/op        0 allocs/op
+BenchmarkWriterBuild
+BenchmarkWriterBuild-12       15768681         76.26 ns/op                        0 B/op        0 allocs/op
+BenchmarkScannerParse
+BenchmarkScannerParse-12        343438       3512.0 ns/op     5274.38 MB/s        0 B/op        0 allocs/op
+PASS
+ok    github.com/tetsuo/mp4 5.023s
+```
