@@ -1,8 +1,9 @@
 name: release
 
 concurrency:
-  group: release-${{ github.head_ref }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: true
+
 on:
   workflow_dispatch:
     inputs:
@@ -14,12 +15,22 @@ on:
         options:
         - minor
         - patch
+      dry_run:
+        description: "Dry run"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
 jobs:
   linux:
+    if: ${{ github.ref_name != 'master' && startsWith(github.ref_name, 'v') && endsWith(github.ref_name, '.x') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: [1.25.x]
+        go-version: [1.26.4]
 
     steps:
     - name: Set up Go
@@ -33,14 +44,31 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Run tests
-      run: go test ./...
+    - name: Install ffmpeg
+      run: |
+        set -euxo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ffmpeg
+
+    - name: Generate test data
+      run: |
+        set -euxo pipefail
+        (cd test-data && ./generate.sh)
+
+        mkdir -p video-media-samples
+        curl -fL --retry 3 -o video-media-samples/big-buck-bunny-480p-30sec.mp4 \
+          https://github.com/chthomos/video-media-samples/raw/refs/heads/master/big-buck-bunny-480p-30sec.mp4
+
+    - name: Run tests and benchmarks
+      run: go test -bench=. -benchmem ./...
 
     - name: Release
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euxo pipefail
+
+        git fetch --all --tags
 
         MAJOR=$(echo "$GITHUB_REF_NAME" | sed -nE 's/^v([0-9]+)\.x$/\1/p')
         if [[ -z "$MAJOR" ]]; then
@@ -52,7 +80,7 @@ jobs:
           local current impact MINOR PATCH
           impact="${1:-patch}"
 
-          current=$(git tag | grep "^v$MAJOR\.[0-9]*\.[0-9]*" | sort -t "." -k1,1nr -k2,2nr -k3,3nr | cut -c2- | head -1) || true
+          current=$(git tag | grep "^v${MAJOR}\.[0-9]*\.[0-9]*$" | sort -t "." -k1,1nr -k2,2nr -k3,3nr | cut -c2- | head -1) || true
 
           if [[ -z "$current" ]]; then
             if [[ "$MAJOR" -eq 0 ]]; then
@@ -66,11 +94,6 @@ jobs:
           IFS='.' read -r _ MINOR PATCH <<< "$current"
 
           case "$impact" in
-            major)
-              ((MAJOR+=1))
-              MINOR=0
-              PATCH=0
-              ;;
             minor)
               ((MINOR+=1))
               PATCH=0
@@ -87,27 +110,26 @@ jobs:
           echo "$MAJOR.$MINOR.$PATCH"
         }
 
-        push_release () {
-          local commit next
+        commit=$(git rev-parse HEAD)
+        if git tag --points-at "$commit" | grep -q .; then
+          echo "Commit already tagged, skipping release"
+          exit 0
+        fi
 
-          commit=$(git rev-parse HEAD)
+        TAG_NAME="v$(next_version "${{ inputs.version }}")"
 
-          if git tag --points-at "$commit" | grep -q .; then
-            echo "Commit already tagged, skipping release"
-            return
-          fi
+        if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+          echo "Tag $TAG_NAME already exists, refusing to overwrite" >&2
+          exit 1
+        fi
 
-          next="v$(next_version "${1:-patch}")"
+        if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+          echo "Dry run: would create tag $TAG_NAME"
+          exit 0
+        fi
 
-          git config user.name github-actions
-          git config user.email github-actions@github.com
+        git config user.name github-actions
+        git config user.email github-actions@github.com
 
-          git tag "$next"
-          git push --tags
-
-          echo "BUILD_VERSION=$next" >> "$GITHUB_ENV"
-        }
-
-        git fetch --all --tags
-
-        push_release minor
+        git tag "$TAG_NAME"
+        git push origin "$TAG_NAME"
