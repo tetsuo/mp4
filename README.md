@@ -1,6 +1,6 @@
 # mp4
 
-ISOBMFF and fragmented MP4 (fMP4) codec.
+ISOBMFF/MP4 container library with fragmented MP4 support.
 
 ## Install
 
