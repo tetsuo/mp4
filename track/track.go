@@ -1,6 +1,7 @@
 package track
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -58,10 +59,22 @@ type Track struct {
 	TimeScale uint32
 	Duration  uint64
 
-	Width        uint16
-	Height       uint16
-	ChannelCount uint16
-	SampleRate   uint32
+	Width         uint16
+	Height        uint16
+	DisplayWidth  uint16
+	DisplayHeight uint16
+	ChannelCount  uint16
+	SampleRate    uint32
+	SampleSize    uint16
+
+	PixelAspectHorizontal uint32
+	PixelAspectVertical   uint32
+	ColorPrimaries        uint16
+	ColorTransfer         uint16
+	ColorMatrix           uint16
+	FullColorRange        bool
+	HasColor              bool
+	RotationDegrees       uint16
 
 	Samples       []Sample
 	SampleDescIdx uint32
@@ -444,8 +457,9 @@ func parseTrakInto(mr *mp4.Reader, track *Track) bool {
 			track.raw.tkhd = mr.Data()
 			trackId, _, w, h := mr.ReadTkhd()
 			track.ID = trackId
-			track.Width = uint16(w >> 16)
-			track.Height = uint16(h >> 16)
+			track.DisplayWidth = uint16(w >> 16)
+			track.DisplayHeight = uint16(h >> 16)
+			track.RotationDegrees = tkhdRotation(track.raw.tkhd, track.raw.tkhdVersion)
 		case mp4.TypeEdts:
 			parseEdts(mr, track)
 		case mp4.TypeMdia:
@@ -581,18 +595,32 @@ func parseStsd(mr *mp4.Reader, track *Track, handlerType [4]byte) {
 			return
 		}
 		v := mp4.ReadVisualSampleEntry(entryData)
+		children := visualChildren(mr, v.ChildOffset)
 		track.Width = v.Width
 		track.Height = v.Height
+		if d := children.pasp; len(d) >= 8 {
+			track.PixelAspectHorizontal = binary.BigEndian.Uint32(d[0:4])
+			track.PixelAspectVertical = binary.BigEndian.Uint32(d[4:8])
+		}
+		if d := children.colr; len(d) >= 10 && (string(d[:4]) == "nclx" || string(d[:4]) == "nclc") {
+			track.ColorPrimaries = binary.BigEndian.Uint16(d[4:6])
+			track.ColorTransfer = binary.BigEndian.Uint16(d[6:8])
+			track.ColorMatrix = binary.BigEndian.Uint16(d[8:10])
+			track.HasColor = true
+			if len(d) >= 11 && string(d[:4]) == "nclx" {
+				track.FullColorRange = d[10]&0x80 != 0
+			}
+		}
 		switch entryType {
 		case mp4.TypeAvc1:
 			track.setCodec("avc1")
-			if d := childBox(mr, v.ChildOffset, mp4.TypeAvcC); len(d) >= 4 {
+			if d := children.avcC; len(d) >= 4 {
 				track.appendCodec(".")
 				track.appendAvcCProfile(d[1], d[2], d[3])
 			}
 		case mp4.TypeAv01:
 			track.setCodec("av01")
-			if d := childBox(mr, v.ChildOffset, mp4.TypeAv1C); len(d) >= 3 {
+			if d := children.av1C; len(d) >= 3 {
 				track.appendAv1CProfile(d)
 			}
 		default:
@@ -607,9 +635,18 @@ func parseStsd(mr *mp4.Reader, track *Track, handlerType [4]byte) {
 				a := mp4.ReadAudioSampleEntry(entryData)
 				track.ChannelCount = a.ChannelCount
 				track.SampleRate = a.SampleRate >> 16
+				track.SampleSize = a.SampleSize
 				if d := childBox(mr, a.ChildOffset, mp4.TypeEsds); d != nil {
 					track.appendEsdsCodec(d)
 				}
+			}
+		case mp4.TypeAlac:
+			track.setCodec("alac")
+			if len(entryData) >= 28 {
+				a := mp4.ReadAudioSampleEntry(entryData)
+				track.ChannelCount = a.ChannelCount
+				track.SampleRate = a.SampleRate >> 16
+				track.SampleSize = a.SampleSize
 			}
 		default:
 			track.setCodec(entryType.String())
@@ -617,6 +654,58 @@ func parseStsd(mr *mp4.Reader, track *Track, handlerType [4]byte) {
 	default:
 		track.Kind = TrackUnknown
 		track.setCodec(entryType.String())
+	}
+}
+
+type visualSampleChildren struct {
+	avcC []byte
+	av1C []byte
+	pasp []byte
+	colr []byte
+}
+
+func visualChildren(mr *mp4.Reader, childOffset int) visualSampleChildren {
+	var children visualSampleChildren
+	mr.Enter()
+	defer mr.Exit()
+	mr.Skip(childOffset)
+	for mr.Next() {
+		switch mr.Type() {
+		case mp4.TypeAvcC:
+			children.avcC = mr.Data()
+		case mp4.TypeAv1C:
+			children.av1C = mr.Data()
+		case mp4.TypePasp:
+			children.pasp = mr.Data()
+		case mp4.TypeColr:
+			children.colr = mr.Data()
+		}
+	}
+	return children
+}
+
+func tkhdRotation(data []byte, version uint8) uint16 {
+	offset := 36
+	if version == 1 {
+		offset = 48
+	}
+	if offset+20 > len(data) {
+		return 0
+	}
+	a := int32(binary.BigEndian.Uint32(data[offset:]))
+	b := int32(binary.BigEndian.Uint32(data[offset+4:]))
+	c := int32(binary.BigEndian.Uint32(data[offset+12:]))
+	d := int32(binary.BigEndian.Uint32(data[offset+16:]))
+	const one = int32(1 << 16)
+	switch {
+	case a == 0 && b == one && c == -one && d == 0:
+		return 90
+	case a == -one && b == 0 && c == 0 && d == -one:
+		return 180
+	case a == 0 && b == -one && c == one && d == 0:
+		return 270
+	default:
+		return 0
 	}
 }
 

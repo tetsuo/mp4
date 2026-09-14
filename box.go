@@ -100,7 +100,9 @@ var (
 	TypeAv1C = BoxType{'a', 'v', '1', 'C'} // AV1 codec configuration record
 	TypeBtrt = BoxType{'b', 't', 'r', 't'} // MPEG-4 bit rate
 	TypePasp = BoxType{'p', 'a', 's', 'p'} // Pixel aspect ratio
+	TypeColr = BoxType{'c', 'o', 'l', 'r'} // Color information
 	TypeMp4a = BoxType{'m', 'p', '4', 'a'} // MPEG-4 audio sample entry
+	TypeAlac = BoxType{'a', 'l', 'a', 'c'} // Apple Lossless audio sample entry
 	TypeEsds = BoxType{'e', 's', 'd', 's'} // ES descriptor
 )
 

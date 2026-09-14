@@ -1,27 +1,44 @@
-package track
+package track_test
 
-import "testing"
+import (
+	"testing"
 
-func TestAppendAv1CProfile(t *testing.T) {
-	tests := []struct {
-		name string
-		rec  []byte
+	"github.com/tetsuo/mp4/track"
+)
+
+// TestParseAV1CodecString checks the av01 codec string the track parser derives
+// from the av1C configuration record for each combination of seq_profile,
+// seq_level_idx, seq_tier, and bit depth. The fixtures are produced by
+// test-data/generate-av1.sh and skipped when absent.
+func TestParseAV1CodecString(t *testing.T) {
+	cases := []struct {
+		file string
 		want string
 	}{
-		// rec[1] = seq_profile<<5 | seq_level_idx
-		// rec[2] = seq_tier<<7 | high_bitdepth<<6 | twelve_bit<<5
-		{"main 8-bit level 8", []byte{0x81, 0x08, 0x00, 0x00}, "av01.0.08M.08"},
-		{"main 8-bit level 12", []byte{0x81, 0x0c, 0x00, 0x00}, "av01.0.12M.08"},
-		{"high tier 10-bit", []byte{0x81, 0x0c, 0xc0, 0x00}, "av01.0.12H.10"},
-		{"profile 2 12-bit", []byte{0x81, 0x48, 0x60, 0x00}, "av01.2.08M.12"},
+		{"../test-data/av1-main8-level8.mp4", "av01.0.08M.08"},
+		{"../test-data/av1-main8-level12.mp4", "av01.0.12M.08"},
+		{"../test-data/av1-hightier10.mp4", "av01.0.12H.10"},
+		{"../test-data/av1-profile2-12bit.mp4", "av01.2.08M.12"},
 	}
-	for _, tt := range tests {
-		tr := &Track{}
-		tr.setCodec("av01")
-		tr.appendAv1CProfile(tt.rec)
-		got := string(tr.raw.codecBuf[:tr.raw.codecLen])
-		if got != tt.want {
-			t.Errorf("%s: got %q, want %q", tt.name, got, tt.want)
-		}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			tracks, _, _, err := track.ParseTracks(readMoov(t, tc.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var vt *track.Track
+			for _, tr := range tracks {
+				if tr.Kind == track.TrackVideo {
+					vt = tr
+					break
+				}
+			}
+			if vt == nil {
+				t.Fatal("no video track parsed")
+			}
+			if got := vt.Codec(); got != tc.want {
+				t.Errorf("Codec() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
