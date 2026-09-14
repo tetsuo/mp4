@@ -69,10 +69,11 @@ list of samples. Each sample carries its byte offset, size, decode and
 presentation timestamps, and sync (keyframe) flag.
 
 ```go
-tracks, duration, err := track.ParseTracks(moovBuf)
+tracks, movieTimescale, duration, err := track.ParseTracks(moovBuf)
 if err != nil {
     log.Fatal(err)
 }
+fmt.Printf("movie: timescale=%d duration=%d\n", movieTimescale, duration)
 
 for _, t := range tracks {
     fmt.Printf("track %d: codec=%s samples=%d\n", t.ID, t.Codec(), len(t.Samples))
@@ -83,6 +84,37 @@ for _, t := range tracks {
         _ = s.IsSync() // keyframe
     }
 }
+```
+
+### Clipping a progressive MP4
+
+The `clip` package copies a time range into a new progressive MP4 without
+re-encoding. A video cut includes the preceding keyframe for decoding and uses
+an edit list so presentation still begins at the requested time.
+
+```go
+src, err := os.Open("video.mp4")
+if err != nil {
+    log.Fatal(err)
+}
+defer src.Close()
+
+info, err := src.Stat()
+if err != nil {
+    log.Fatal(err)
+}
+
+dst, err := os.Create("clip.mp4")
+if err != nil {
+    log.Fatal(err)
+}
+defer dst.Close()
+
+result, err := clip.Cut(dst, src, info.Size(), 30, 45)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("wrote %.1fs clip (%d bytes)\n", result.Duration, result.Size)
 ```
 
 ### Fragmenting to fMP4
