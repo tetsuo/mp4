@@ -53,11 +53,12 @@ jobs:
     - name: Generate test data
       run: |
         set -euxo pipefail
-        (cd test-data && ./generate.sh)
+        ./test-data/generate.sh
+        ./test-data/generate-av1.sh
 
-        mkdir -p video-media-samples
-        curl -fL --retry 3 -o video-media-samples/big-buck-bunny-480p-30sec.mp4 \
-          https://github.com/chthomos/video-media-samples/raw/refs/heads/master/big-buck-bunny-480p-30sec.mp4
+        curl -fL --retry 3 \
+          -o test-data/big-buck-bunny-480p-30sec.mp4 \
+          https://raw.githubusercontent.com/chthomos/video-media-samples/master/big-buck-bunny-480p-30sec.mp4
 
     - name: Run tests and benchmarks
       run: go test -bench=. -benchmem ./...

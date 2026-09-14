@@ -10,7 +10,7 @@ import (
 	"github.com/tetsuo/mp4/fragment"
 )
 
-const testFile = "../video-media-samples/big-buck-bunny-480p-30sec.mp4"
+const testFile = "../test-data/big-buck-bunny-480p-30sec.mp4"
 
 func openTestFile(t testing.TB) *os.File {
 	t.Helper()

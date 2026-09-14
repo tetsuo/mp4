@@ -10,7 +10,7 @@ import (
 
 func loadTestFile(b *testing.B) []byte {
 	b.Helper()
-	data, err := os.ReadFile("video-media-samples/big-buck-bunny-480p-30sec.mp4")
+	data, err := os.ReadFile("test-data/big-buck-bunny-480p-30sec.mp4")
 	if err != nil {
 		b.Skipf("test file not available: %v", err)
 	}
@@ -143,7 +143,7 @@ func BenchmarkWriterBuild(b *testing.B) {
 }
 
 func BenchmarkScannerParse(b *testing.B) {
-	path := "video-media-samples/big-buck-bunny-480p-30sec.mp4"
+	path := "test-data/big-buck-bunny-480p-30sec.mp4"
 	f, err := os.Open(path)
 	if err != nil {
 		b.Skipf("test file not available: %v", err)
