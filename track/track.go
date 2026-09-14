@@ -571,7 +571,10 @@ func parseStbl(mr *mp4.Reader, track *Track, handlerType [4]byte) {
 		track.raw.sampleCount = stszIt.Count()
 	}
 
-	// Extract SampleDescIdx from first stsc entry (needed for init segment writing)
+	// The sample description index is 1-based; zero is invalid. A fragmented
+	// input has an empty stsc, so default to the first description rather
+	// than letting the index stay zero, which would poison a rebuilt trex.
+	track.SampleDescIdx = 1
 	if track.raw.stscData != nil {
 		stscIt := mp4.NewStscIter(track.raw.stscData)
 		if entry, ok := stscIt.Next(); ok {

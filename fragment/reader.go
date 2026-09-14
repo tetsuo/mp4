@@ -47,10 +47,12 @@ var (
 	ErrInvalidTimeRange = errors.New("invalid time range")
 	// ErrReaderNotInitialized is returned when ReadFragment or Seek is called before initialization.
 	ErrReaderNotInitialized = errors.New("reader not initialized")
-	// ErrNoVideoTrack is returned when no video track is found in the init segment.
-	ErrNoVideoTrack = errors.New("no video track")
 	// ErrInvalidDuration is returned when a non-positive target duration is set.
 	ErrInvalidDuration = errors.New("invalid target duration")
+	// ErrTrackNotFound is returned when a requested track is not present.
+	ErrTrackNotFound = errors.New("track not found")
+	// ErrUnalignedVideoTrack is returned when video tracks do not share fragment boundaries.
+	ErrUnalignedVideoTrack = errors.New("unaligned video track")
 )
 
 const (
@@ -62,13 +64,9 @@ const (
 	// (unless a sync point forces a break).
 	minFragmentDuration = 1
 
-	// maxTracks is the maximum number of concurrent tracks supported.
-	// Limited to 4 to keep per-track arrays on the stack and avoid
-	// heap allocations in the hot path.
-	maxTracks = 4
-
-	// movieTimescale is the timescale written into the init segment's mvhd.
-	movieTimescale = 1000
+	// defaultMovieTimescale is written into the init segment's mvhd when the
+	// source movie timescale is missing or zero.
+	defaultMovieTimescale = 1000
 )
 
 // InitSegment holds parsed initialization data (ftyp+moov) for a fragmented MP4.
@@ -76,6 +74,8 @@ type InitSegment struct {
 	Tracks   []*track.Track
 	Duration uint64
 	buf      []byte
+
+	movieTimescale uint32
 }
 
 // VideoTrack returns the first video track, or nil.
@@ -103,6 +103,23 @@ func (s *InitSegment) Bytes() []byte {
 	return s.buf
 }
 
+// MovieTimescale returns the source movie's timescale used by Duration.
+func (s *InitSegment) MovieTimescale() uint32 {
+	return s.movieTimescale
+}
+
+// TrackBytes builds an initialization segment containing only trackID. dst is
+// reused when it has enough capacity, allowing callers that build many
+// renditions to retain their own buffers without an allocation after warmup.
+func (s *InitSegment) TrackBytes(dst []byte, trackID uint32) ([]byte, error) {
+	selected := track.FindTrack(s.Tracks, trackID)
+	if selected == nil {
+		return nil, ErrTrackNotFound
+	}
+	tracks := [1]*track.Track{selected}
+	return buildInitSegment(dst, tracks[:], s.movieTimescale, s.Duration), nil
+}
+
 // Fragment represents samples for one moof+mdat pair.
 //
 // Returned by [Reader.ReadFragment]; valid until the next ReadFragment call.
@@ -118,14 +135,9 @@ type Reader struct {
 	sc      mp4.Scanner
 	initSeg *InitSegment // points to initSegStorage once initialized
 
-	trackIdx     [maxTracks]int
-	dtsBase      [maxTracks]int64
-	dtsBaseSet   [maxTracks]bool
-	trackCount   int
-	videoTrackID uint32
+	trackState []readerTrackState
 
-	videoRun [2]int // last fragment's video sample range [start, end)
-	audioRun [2]int // last fragment's audio sample range [start, end)
+	selectedTrackID uint32
 
 	sequenceNum    uint32
 	startTime      float64
@@ -141,6 +153,14 @@ type Reader struct {
 
 	initSegStorage InitSegment    // reused backing for the returned init segment
 	filtered       []*track.Track // reused backing for initSegStorage.Tracks
+}
+
+type readerTrackState struct {
+	dtsBase    int64
+	sampleIdx  int
+	runStart   int
+	runEnd     int
+	dtsBaseSet bool
 }
 
 // NewReader creates a new fragment reader. It parses the moov box from
@@ -168,6 +188,7 @@ func (f *Reader) Reset(rs io.ReadSeeker) (*InitSegment, error) {
 		initBuf:        f.initBuf[:0],
 		fragSamples:    f.fragSamples[:0],
 		filtered:       f.filtered[:0],
+		trackState:     f.trackState[:0],
 		targetDuration: f.targetDuration,
 	}
 	return f.readInit()
@@ -205,6 +226,22 @@ func (f *Reader) SetTargetDuration(seconds float64) error {
 	return nil
 }
 
+// SelectTrack makes trackID the fragment cut driver and excludes every other
+// track from subsequent fragments. Passing an unknown track ID returns
+// ErrTrackNotFound. Selection resets reading to the configured time range.
+func (f *Reader) SelectTrack(trackID uint32) error {
+	if f.initSeg == nil {
+		return ErrReaderNotInitialized
+	}
+	if track.FindTrack(f.initSeg.Tracks, trackID) == nil {
+		return ErrTrackNotFound
+	}
+	f.selectedTrackID = trackID
+	f.sequenceNum = 1
+	f.initTrackIndices()
+	return nil
+}
+
 // readInit parses the moov box and builds the init segment.
 func (f *Reader) readInit() (*InitSegment, error) {
 	if f.initSeg != nil {
@@ -216,90 +253,102 @@ func (f *Reader) readInit() (*InitSegment, error) {
 		return nil, err
 	}
 
-	tracks, _, duration, err := track.ParseTracksInto(f.allTracks, moovBuf)
+	tracks, movieTimescale, duration, err := track.ParseTracksInto(f.allTracks, moovBuf)
 	if err != nil {
 		return nil, err
 	}
 	f.allTracks = tracks
 
-	// Filter to first video + first audio only.
+	// Retain every playable track in source order. The parsed allTracks slice is
+	// kept separately so Reset can reuse every Track and its sample storage.
 	f.filtered = f.filtered[:0]
-	hasVideo, hasAudio := false, false
 	for _, t := range tracks {
-		if t.Kind == track.TrackVideo && !hasVideo {
+		if t.Kind == track.TrackVideo || t.Kind == track.TrackAudio {
 			f.filtered = append(f.filtered, t)
-			hasVideo = true
-		} else if t.Kind == track.TrackAudio && !hasAudio {
-			f.filtered = append(f.filtered, t)
-			hasAudio = true
 		}
 	}
 	if len(f.filtered) == 0 {
 		return nil, ErrNoPlayableTracks
 	}
 
+	if movieTimescale == 0 {
+		movieTimescale = defaultMovieTimescale
+	}
 	initSeg := &f.initSegStorage
 	initSeg.Tracks = f.filtered
 	initSeg.Duration = duration
-	initSeg.buf = f.buildInitSegment(initSeg.Tracks, initSeg.Duration)
+	initSeg.movieTimescale = movieTimescale
+	f.initBuf = buildInitSegment(f.initBuf, initSeg.Tracks, movieTimescale, initSeg.Duration)
+	initSeg.buf = f.initBuf
 
 	f.initSeg = initSeg
-	f.trackCount = len(initSeg.Tracks)
 	f.sequenceNum = 1
-
-	if vt := initSeg.VideoTrack(); vt != nil {
-		f.videoTrackID = vt.ID
-	}
+	f.resizeTrackState(len(initSeg.Tracks))
 
 	f.initTrackIndices()
 	return initSeg, nil
 }
 
+func (f *Reader) resizeTrackState(n int) {
+	f.trackState = resizeAndClear(f.trackState, n)
+}
+
+func resizeAndClear[T any](s []T, n int) []T {
+	if cap(s) < n {
+		return make([]T, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
+}
+
 func (f *Reader) initTrackIndices() {
-	f.dtsBaseSet = [maxTracks]bool{}
-	f.dtsBase = [maxTracks]int64{}
+	clear(f.trackState)
 
-	videoTrack := f.initSeg.VideoTrack()
-	var videoStartPTS int64
-
-	for i, t := range f.initSeg.Tracks {
-		if t.Kind == track.TrackVideo && f.startTime > 0 {
-			idx := f.findSampleAfter(t, f.startTime)
-			n := len(t.Samples)
-
-			if f.endTime > 0 && idx < n {
-				endTimeScaled := int64(f.endTime * float64(t.TimeScale))
-				if t.Samples[idx].PTS() >= endTimeScaled {
-					idx = f.findSampleBefore(t, f.startTime)
-				}
+	driver := f.cutTrack()
+	driverIdx := f.getTrackIndex(driver.ID)
+	idx := 0
+	if f.startTime > 0 {
+		requireSync := driver.Kind == track.TrackVideo
+		idx = f.findSampleAfter(driver, f.startTime, requireSync)
+		if f.endTime > 0 && idx < len(driver.Samples) {
+			endTimeScaled := int64(f.endTime * float64(driver.TimeScale))
+			if driver.Samples[idx].PTS() >= endTimeScaled {
+				idx = f.findSampleBefore(driver, f.startTime, requireSync)
 			}
-
-			f.trackIdx[i] = idx
-			if idx < n {
-				videoStartPTS = t.Samples[idx].PTS()
-			}
-		} else if t.Kind == track.TrackVideo {
-			f.trackIdx[i] = 0
 		}
+	}
+	f.trackState[driverIdx].sampleIdx = idx
+	var driverStartPTS int64
+	if idx < len(driver.Samples) {
+		driverStartPTS = driver.Samples[idx].PTS()
 	}
 
 	for i, t := range f.initSeg.Tracks {
-		if t.Kind == track.TrackVideo {
+		if i == driverIdx {
 			continue
 		}
-		if f.startTime > 0 && videoTrack != nil {
-			audioStartTicks := videoStartPTS * int64(t.TimeScale) / int64(videoTrack.TimeScale)
+		if f.startTime > 0 {
+			startTicks := driverStartPTS * int64(t.TimeScale) / int64(driver.TimeScale)
 			idx := sort.Search(len(t.Samples), func(j int) bool {
-				return t.Samples[j].PTS() >= audioStartTicks
+				return t.Samples[j].PTS() >= startTicks
 			})
-			f.trackIdx[i] = idx
-		} else {
-			f.trackIdx[i] = 0
+			f.trackState[i].sampleIdx = idx
 		}
 	}
 }
 
-func (f *Reader) findSampleAfter(track *track.Track, timeSeconds float64) int {
+func (f *Reader) cutTrack() *track.Track {
+	if f.selectedTrackID != 0 {
+		return track.FindTrack(f.initSeg.Tracks, f.selectedTrackID)
+	}
+	if video := f.initSeg.VideoTrack(); video != nil {
+		return video
+	}
+	return f.initSeg.AudioTrack()
+}
+
+func (f *Reader) findSampleAfter(track *track.Track, timeSeconds float64, requireSync bool) int {
 	scaledTime := int64(timeSeconds * float64(track.TimeScale))
 	n := len(track.Samples)
 	idx := sort.Search(n, func(i int) bool {
@@ -308,7 +357,7 @@ func (f *Reader) findSampleAfter(track *track.Track, timeSeconds float64) int {
 	if idx >= n {
 		return n - 1
 	}
-	for idx < n && !track.Samples[idx].IsSync() {
+	for requireSync && idx < n && !track.Samples[idx].IsSync() {
 		idx++
 	}
 	if idx >= n {
@@ -317,13 +366,13 @@ func (f *Reader) findSampleAfter(track *track.Track, timeSeconds float64) int {
 	return idx
 }
 
-func (f *Reader) findSampleBefore(track *track.Track, timeSeconds float64) int {
+func (f *Reader) findSampleBefore(track *track.Track, timeSeconds float64, requireSync bool) int {
 	scaledTime := int64(timeSeconds * float64(track.TimeScale))
 	n := len(track.Samples)
 	idx := max(sort.Search(n, func(i int) bool {
 		return track.Samples[i].PTS() > scaledTime
 	})-1, 0)
-	for idx > 0 && !track.Samples[idx].IsSync() {
+	for requireSync && idx > 0 && !track.Samples[idx].IsSync() {
 		idx--
 	}
 	return idx
@@ -339,100 +388,108 @@ func (f *Reader) getTrackIndex(trackID uint32) int {
 }
 
 // appendSample adds a sample with DTS rebased relative to the first sample per track.
-func (f *Reader) appendSample(trackIdx int, s track.Sample) {
-	if !f.dtsBaseSet[trackIdx] {
-		f.dtsBase[trackIdx] = s.DTS
-		f.dtsBaseSet[trackIdx] = true
+func (f *Reader) appendSample(state *readerTrackState, s track.Sample) {
+	if !state.dtsBaseSet {
+		state.dtsBase = s.DTS
+		state.dtsBaseSet = true
 	}
-	s.DTS -= f.dtsBase[trackIdx]
+	s.DTS -= state.dtsBase
 	f.fragSamples = append(f.fragSamples, s)
 }
 
-// ReadFragment returns the next fragment.
+// ReadFragment returns the next fragment. A track selected with SelectTrack
+// drives cuts by itself. Otherwise video drives cuts when present, and audio
+// drives cuts for audio-only input.
 // Returns [io.EOF] when there are no more fragments to read.
 func (f *Reader) ReadFragment() (*Fragment, error) {
 	if f.initSeg == nil {
 		return nil, ErrReaderNotInitialized
 	}
 
-	videoTrack := f.initSeg.VideoTrack()
-	if videoTrack == nil {
-		return nil, ErrNoVideoTrack
-	}
+	driver := f.cutTrack()
+	driverIdx := f.getTrackIndex(driver.ID)
+	driverState := &f.trackState[driverIdx]
+	driverSampleIdx := driverState.sampleIdx
 
-	videoTrackIdx := f.getTrackIndex(videoTrack.ID)
-	videoSampleIdx := f.trackIdx[videoTrackIdx]
-
-	if videoSampleIdx >= len(videoTrack.Samples) {
+	if driverSampleIdx >= len(driver.Samples) {
 		return nil, io.EOF
 	}
 
 	var endTimeScaled int64
 	if f.endTime > 0 {
-		endTimeScaled = int64(f.endTime * float64(videoTrack.TimeScale))
+		endTimeScaled = int64(f.endTime * float64(driver.TimeScale))
 	}
 
-	if endTimeScaled > 0 && videoTrack.Samples[videoSampleIdx].PTS() >= endTimeScaled {
+	if endTimeScaled > 0 && driver.Samples[driverSampleIdx].PTS() >= endTimeScaled {
 		return nil, io.EOF
 	}
 
-	startDTS := videoTrack.Samples[videoSampleIdx].DTS
-	threshold := int64(f.targetDuration * float64(videoTrack.TimeScale))
-	lastVideoIdx := videoSampleIdx
+	startDTS := driver.Samples[driverSampleIdx].DTS
+	threshold := int64(f.targetDuration * float64(driver.TimeScale))
+	lastDriverIdx := driverSampleIdx
 
-	for lastVideoIdx < len(videoTrack.Samples) {
-		s := videoTrack.Samples[lastVideoIdx]
+	for lastDriverIdx < len(driver.Samples) {
+		s := driver.Samples[lastDriverIdx]
 		if endTimeScaled > 0 && s.PTS() >= endTimeScaled {
 			break
 		}
-		if endTimeScaled == 0 && lastVideoIdx > videoSampleIdx && s.IsSync() {
+		cutPoint := driver.Kind == track.TrackAudio || s.IsSync()
+		if endTimeScaled == 0 && lastDriverIdx > driverSampleIdx && cutPoint {
 			if s.DTS-startDTS >= threshold {
 				break
 			}
 		}
-		lastVideoIdx++
+		lastDriverIdx++
 	}
 
-	if lastVideoIdx == videoSampleIdx {
+	if lastDriverIdx == driverSampleIdx {
 		return nil, io.EOF
 	}
 
-	f.videoRun = [2]int{videoSampleIdx, lastVideoIdx}
-	f.audioRun = [2]int{}
+	if f.selectedTrackID != 0 {
+		for i := range f.trackState {
+			f.trackState[i].runStart = 0
+			f.trackState[i].runEnd = 0
+		}
+	}
+	driverState.runStart = driverSampleIdx
+	driverState.runEnd = lastDriverIdx
 
-	var audioStart [maxTracks]int
-	var audioEnd [maxTracks]int
-	need := lastVideoIdx - videoSampleIdx
+	need := lastDriverIdx - driverSampleIdx
 
-	fragStartPTS := videoTrack.Samples[videoSampleIdx].PTS()
+	fragStartPTS := driver.Samples[driverSampleIdx].PTS()
 	var fragEndPTS int64
-	if lastVideoIdx < len(videoTrack.Samples) {
-		fragEndPTS = videoTrack.Samples[lastVideoIdx].PTS()
+	if lastDriverIdx < len(driver.Samples) {
+		fragEndPTS = driver.Samples[lastDriverIdx].PTS()
 	} else {
-		lastSample := videoTrack.Samples[lastVideoIdx-1]
+		lastSample := driver.Samples[lastDriverIdx-1]
 		fragEndPTS = lastSample.DTS + int64(lastSample.Duration)
 	}
 
-	for i, t := range f.initSeg.Tracks {
-		if t.Kind == track.TrackVideo {
-			continue
+	if f.selectedTrackID == 0 {
+		for i, t := range f.initSeg.Tracks {
+			if i == driverIdx {
+				continue
+			}
+			startTicks := fragStartPTS * int64(t.TimeScale) / int64(driver.TimeScale)
+			endTicks := fragEndPTS * int64(t.TimeScale) / int64(driver.TimeScale)
+			state := &f.trackState[i]
+			idx := state.sampleIdx
+			n := len(t.Samples)
+			for idx < n && t.Samples[idx].PTS() < startTicks {
+				idx++
+			}
+			start := idx
+			for idx < n && t.Samples[idx].PTS() < endTicks {
+				idx++
+			}
+			if t.Kind == track.TrackVideo && start < idx && !t.Samples[start].IsSync() {
+				return nil, ErrUnalignedVideoTrack
+			}
+			state.runStart = start
+			state.runEnd = idx
+			need += idx - start
 		}
-		startTicks := fragStartPTS * int64(t.TimeScale) / int64(videoTrack.TimeScale)
-		endTicks := fragEndPTS * int64(t.TimeScale) / int64(videoTrack.TimeScale)
-		idx := f.trackIdx[i]
-		n := len(t.Samples)
-		for idx < n && t.Samples[idx].PTS() < startTicks {
-			idx++
-		}
-		audioStart[i] = idx
-		for idx < n && t.Samples[idx].PTS() < endTicks {
-			idx++
-		}
-		audioEnd[i] = idx
-		if t.Kind == track.TrackAudio {
-			f.audioRun = [2]int{audioStart[i], audioEnd[i]}
-		}
-		need += idx - audioStart[i]
 	}
 
 	if cap(f.fragSamples) < need {
@@ -440,21 +497,23 @@ func (f *Reader) ReadFragment() (*Fragment, error) {
 	}
 	f.fragSamples = f.fragSamples[:0]
 
-	// Append video samples
-	for i := videoSampleIdx; i < lastVideoIdx; i++ {
-		f.appendSample(videoTrackIdx, videoTrack.Samples[i])
+	for i := driverSampleIdx; i < lastDriverIdx; i++ {
+		f.appendSample(driverState, driver.Samples[i])
 	}
-	f.trackIdx[videoTrackIdx] = lastVideoIdx
+	driverState.sampleIdx = lastDriverIdx
 
-	for i, t := range f.initSeg.Tracks {
-		if t.Kind == track.TrackVideo {
-			continue
+	if f.selectedTrackID == 0 {
+		for i, t := range f.initSeg.Tracks {
+			if i == driverIdx {
+				continue
+			}
+			state := &f.trackState[i]
+			start, end := state.runStart, state.runEnd
+			for j := start; j < end; j++ {
+				f.appendSample(state, t.Samples[j])
+			}
+			state.sampleIdx = end
 		}
-		// Append audio samples
-		for j := audioStart[i]; j < audioEnd[i]; j++ {
-			f.appendSample(i, t.Samples[j])
-		}
-		f.trackIdx[i] = audioEnd[i]
 	}
 
 	f.frag.Samples = f.fragSamples
@@ -463,16 +522,34 @@ func (f *Reader) ReadFragment() (*Fragment, error) {
 	return &f.frag, nil
 }
 
-// VideoRun returns the video track's sample range [start, end) in the most
-// recent fragment returned by ReadFragment.
-func (f *Reader) VideoRun() (start, end int) {
-	return f.videoRun[0], f.videoRun[1]
+// TrackRun returns a track's sample range [start, end) in the most recent
+// fragment returned by ReadFragment. It returns (0, 0) for an unknown track.
+func (f *Reader) TrackRun(trackID uint32) (start, end int) {
+	i := f.getTrackIndex(trackID)
+	if i < 0 {
+		return 0, 0
+	}
+	return f.trackState[i].runStart, f.trackState[i].runEnd
 }
 
-// AudioRun returns the audio track's sample range [start, end) in the most
-// recent fragment, or (0, 0) when there is no audio track.
+// VideoRun returns the first video track's sample range [start, end) in the
+// most recent fragment returned by ReadFragment.
+func (f *Reader) VideoRun() (start, end int) {
+	video := f.initSeg.VideoTrack()
+	if video == nil {
+		return 0, 0
+	}
+	return f.TrackRun(video.ID)
+}
+
+// AudioRun returns the first audio track's sample range [start, end) in the
+// most recent fragment, or (0, 0) when there is no audio track.
 func (f *Reader) AudioRun() (start, end int) {
-	return f.audioRun[0], f.audioRun[1]
+	audio := f.initSeg.AudioTrack()
+	if audio == nil {
+		return 0, 0
+	}
+	return f.TrackRun(audio.ID)
 }
 
 // Seek repositions reading to the given time (in seconds).
@@ -524,17 +601,22 @@ func (f *Reader) findMoov() ([]byte, error) {
 	return nil, ErrNoMoov
 }
 
-// buildInitSegment constructs ftyp+moov for fragmented MP4.
-func (f *Reader) buildInitSegment(tracks []*track.Track, duration uint64) []byte {
+// buildInitSegment constructs ftyp+moov for fragmented MP4, reusing dst when
+// it has enough capacity.
+func buildInitSegment(dst []byte, tracks []*track.Track, movieTimescale uint32, duration uint64) []byte {
+	if movieTimescale == 0 {
+		movieTimescale = defaultMovieTimescale
+	}
+
 	estSize := 256
 	for _, track := range tracks {
 		estSize += 256 + len(track.HdlrRaw()) + len(track.DinfRaw()) + len(track.StsdRaw()) + len(track.TkhdRaw()) + len(track.MdhdRaw())
 	}
 
-	if cap(f.initBuf) < estSize {
-		f.initBuf = make([]byte, estSize)
+	if cap(dst) < estSize {
+		dst = make([]byte, estSize)
 	}
-	buf := f.initBuf[:estSize]
+	buf := dst[:estSize]
 	w := mp4.NewWriter(buf)
 
 	w.WriteFtyp([4]byte{'i', 's', 'o', '5'}, 0,
@@ -542,10 +624,16 @@ func (f *Reader) buildInitSegment(tracks []*track.Track, duration uint64) []byte
 
 	w.StartBox(mp4.TypeMoov)
 	{
-		w.WriteMvhd(movieTimescale, 0, uint32(len(tracks)+1))
+		nextTrackID := uint32(1)
+		for _, track := range tracks {
+			if track.ID >= nextTrackID {
+				nextTrackID = track.ID + 1
+			}
+		}
+		w.WriteMvhd(movieTimescale, 0, nextTrackID)
 
 		for _, track := range tracks {
-			writeInitTrak(&w, track)
+			writeInitTrak(&w, movieTimescale, track)
 		}
 
 		w.StartBox(mp4.TypeMvex)
@@ -562,13 +650,13 @@ func (f *Reader) buildInitSegment(tracks []*track.Track, duration uint64) []byte
 	return w.Bytes()
 }
 
-func writeInitTrak(w *mp4.Writer, track *track.Track) {
+func writeInitTrak(w *mp4.Writer, movieTimescale uint32, track *track.Track) {
 	w.StartBox(mp4.TypeTrak)
 	{
 		writeTkhdZeroDuration(w, track)
 
 		if mt, ok := track.EditMediaTime(); ok && track.TimeScale > 0 {
-			segDur := track.Duration * movieTimescale / uint64(track.TimeScale)
+			segDur := track.Duration * uint64(movieTimescale) / uint64(track.TimeScale)
 			w.StartBox(mp4.TypeEdts)
 			w.WriteElst([]mp4.ElstEntry{{
 				SegmentDuration: segDur,

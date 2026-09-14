@@ -7,6 +7,8 @@ import (
 	"github.com/tetsuo/mp4"
 )
 
+const defaultWriterTrackCapacity = 4
+
 // Writer writes fragmented MP4 segments.
 type Writer struct {
 	w       io.Writer
@@ -21,14 +23,29 @@ type Writer struct {
 	mdatPayload int64
 
 	// Per-track scratch buffers.
-	sampleIdx [maxTracks][]int
-	trunBuf   [maxTracks][]mp4.TrunEntry
-	ranges    []byteRange
+	trackIDs        []uint32
+	sampleIdx       [][]int
+	trunBuf         [][]mp4.TrunEntry
+	trafs           []trafInfo
+	trackDataOffset []int32
+	patches         []trunPatch
+	ranges          []byteRange
 }
 
 type byteRange struct {
 	offset int64
 	size   int64
+}
+
+type trafInfo struct {
+	trackID uint32
+	baseDTS int64
+	hasCtts bool
+}
+
+type trunPatch struct {
+	pos       int
+	dataStart int32
 }
 
 // NewWriter creates a fragment writer which writes to the provided [io.Writer].
@@ -38,12 +55,7 @@ func NewWriter(w io.Writer) *Writer {
 		buf:    make([]byte, 65536),
 		ranges: make([]byteRange, 0, 1024),
 	}
-	for i := range wr.sampleIdx {
-		wr.sampleIdx[i] = make([]int, 0, 512)
-	}
-	for i := range wr.trunBuf {
-		wr.trunBuf[i] = make([]mp4.TrunEntry, 0, 512)
-	}
+	wr.ensureTrackGroups(defaultWriterTrackCapacity)
 	return wr
 }
 
@@ -67,9 +79,19 @@ func (w *Writer) WriteFragment(frag *Fragment, src io.ReaderAt) error {
 	return w.WriteBodyRange(w.w, src, 0, w.BodySize())
 }
 
-// BodySize returns the byte size of the body (moof + mdat) of the fragment last
-// passed to [Writer.Prepare]. It is moofSize + 8 + sum(sample sizes), all known
-// from sample metadata, so the size is available before any media is read.
+// WriteFragmentTrack writes a single-track moof+mdat fragment. Only samples
+// whose track id equals trackID are described and copied from src.
+func (w *Writer) WriteFragmentTrack(frag *Fragment, trackID uint32, src io.ReaderAt) error {
+	if err := w.PrepareTrack(frag, trackID); err != nil {
+		return err
+	}
+	return w.WriteBodyRange(w.w, src, 0, w.BodySize())
+}
+
+// BodySize returns the byte size of the body (moof + mdat) prepared by the last
+// call to [Writer.Prepare] or [Writer.PrepareTrack]. It is moofSize + 8 +
+// sum(sample sizes), all known from sample metadata, so the size is available
+// before any media is read.
 func (w *Writer) BodySize() int64 {
 	return int64(len(w.moof)) + 8 + w.mdatPayload
 }
@@ -77,33 +99,56 @@ func (w *Writer) BodySize() int64 {
 // Prepare builds the moof for frag from sample metadata alone, reading no media.
 // It records the moof bytes and the mdat payload size so [Writer.BodySize] and
 // [Writer.WriteBodyRange] can write the body, or a byte window of it, afterward.
-// The recorded state is valid until the next call to Prepare on this writer.
+// The recorded state is valid until the next call to Prepare or PrepareTrack on
+// this writer.
 func (w *Writer) Prepare(frag *Fragment) error {
+	return w.prepare(frag, 0, false)
+}
+
+// PrepareTrack is Prepare for one track. It builds a moof and mdat layout from
+// only the samples whose track id equals trackID, without copying sample
+// metadata or reading media bytes.
+func (w *Writer) PrepareTrack(frag *Fragment, trackID uint32) error {
+	return w.prepare(frag, trackID, true)
+}
+
+func (w *Writer) prepare(frag *Fragment, trackID uint32, singleTrack bool) error {
 	// Group samples by track
-	var trackIDs [maxTracks]uint32
 	groupCount := 0
 
 	for i := range w.sampleIdx {
 		w.sampleIdx[i] = w.sampleIdx[i][:0]
 	}
 
-	for i := range frag.Samples {
-		s := &frag.Samples[i]
-		found := false
-		for g := 0; g < groupCount; g++ {
-			if trackIDs[g] == s.TrackID {
-				w.sampleIdx[g] = append(w.sampleIdx[g], i)
-				found = true
-				break
+	if singleTrack {
+		w.ensureTrackGroups(1)
+		w.trackIDs[0] = trackID
+		for i := range frag.Samples {
+			if frag.Samples[i].TrackID == trackID {
+				w.sampleIdx[0] = append(w.sampleIdx[0], i)
 			}
 		}
-		if !found {
-			if groupCount >= maxTracks {
-				continue
+		if len(w.sampleIdx[0]) == 0 {
+			return ErrTrackNotFound
+		}
+		groupCount = 1
+	} else {
+		for i := range frag.Samples {
+			s := &frag.Samples[i]
+			found := false
+			for g := 0; g < groupCount; g++ {
+				if w.trackIDs[g] == s.TrackID {
+					w.sampleIdx[g] = append(w.sampleIdx[g], i)
+					found = true
+					break
+				}
 			}
-			trackIDs[groupCount] = s.TrackID
-			w.sampleIdx[groupCount] = append(w.sampleIdx[groupCount], i)
-			groupCount++
+			if !found {
+				w.ensureTrackGroups(groupCount + 1)
+				w.trackIDs[groupCount] = s.TrackID
+				w.sampleIdx[groupCount] = append(w.sampleIdx[groupCount], i)
+				groupCount++
+			}
 		}
 	}
 
@@ -133,19 +178,14 @@ func (w *Writer) Prepare(frag *Fragment) error {
 	mdatHeaderSize := int32(8)
 
 	// Build trun entries per track group
-	type trafInfo struct {
-		trackID uint32
-		baseDTS int64
-		hasCtts bool
-	}
-	var trafs [maxTracks]trafInfo
-
+	sampleCount := 0
 	for g := 0; g < groupCount; g++ {
-		ti := &trafs[g]
-		ti.trackID = trackIDs[g]
+		ti := &w.trafs[g]
+		*ti = trafInfo{trackID: w.trackIDs[g]}
 		w.trunBuf[g] = w.trunBuf[g][:0]
 
 		indices := w.sampleIdx[g]
+		sampleCount += len(indices)
 		if len(indices) > 0 {
 			ti.baseDTS = frag.Samples[indices[0]].DTS
 		}
@@ -166,23 +206,16 @@ func (w *Writer) Prepare(frag *Fragment) error {
 	}
 
 	// Track data layout in mdat
-	var trackDataOffsets [maxTracks]int32
 	var accum int32
 	for g := 0; g < groupCount; g++ {
-		trackDataOffsets[g] = accum
+		w.trackDataOffset[g] = accum
 		for _, idx := range w.sampleIdx[g] {
 			accum += int32(frag.Samples[idx].Size())
 		}
 	}
 
 	// Build moof, recording trun data_offset positions for backpatching
-	type trunPatch struct {
-		pos       int
-		dataStart int32
-	}
-	var patches [maxTracks]trunPatch
-	patchCount := 0
-
+	w.ensureMoofCapacity(groupCount, sampleCount)
 	mw := mp4.NewWriter(w.buf)
 	mw.Reset()
 
@@ -190,7 +223,7 @@ func (w *Writer) Prepare(frag *Fragment) error {
 	mw.WriteMfhd(frag.SequenceNum)
 
 	for g := 0; g < groupCount; g++ {
-		ti := &trafs[g]
+		ti := &w.trafs[g]
 		entries := w.trunBuf[g]
 		n := len(entries)
 
@@ -247,12 +280,9 @@ func (w *Writer) Prepare(frag *Fragment) error {
 		mw.WriteTfdt(uint64(ti.baseDTS))
 
 		trunStart := mw.Len()
-		if patchCount < maxTracks {
-			patches[patchCount] = trunPatch{
-				pos:       trunStart + 16, // offset to data_offset field
-				dataStart: trackDataOffsets[g],
-			}
-			patchCount++
+		w.patches[g] = trunPatch{
+			pos:       trunStart + 16, // offset to data_offset field
+			dataStart: w.trackDataOffset[g],
 		}
 		mw.WriteTrun(trunFlags, 0, firstSampleFlags, entries)
 
@@ -260,13 +290,16 @@ func (w *Writer) Prepare(frag *Fragment) error {
 	}
 
 	mw.EndBox() // moof
+	if err := mw.Err(); err != nil {
+		return err
+	}
 
 	moofSize := int32(mw.Len())
 
 	// Backpatch data_offset fields
 	moofBytes := mw.Bytes()
-	for i := 0; i < patchCount; i++ {
-		p := patches[i]
+	for i := 0; i < groupCount; i++ {
+		p := w.patches[i]
 		dataOffset := moofSize + mdatHeaderSize + p.dataStart
 		binary.BigEndian.PutUint32(moofBytes[p.pos:], uint32(dataOffset))
 	}
@@ -276,12 +309,54 @@ func (w *Writer) Prepare(frag *Fragment) error {
 	return nil
 }
 
+func (w *Writer) ensureTrackGroups(n int) {
+	old := len(w.trackIDs)
+	if old >= n {
+		return
+	}
+	w.trackIDs = growSlice(w.trackIDs, n)
+	w.sampleIdx = growSlice(w.sampleIdx, n)
+	w.trunBuf = growSlice(w.trunBuf, n)
+	w.trafs = growSlice(w.trafs, n)
+	w.trackDataOffset = growSlice(w.trackDataOffset, n)
+	w.patches = growSlice(w.patches, n)
+	for i := old; i < n; i++ {
+		capacity := 0
+		if i < defaultWriterTrackCapacity {
+			capacity = 512
+		}
+		w.sampleIdx[i] = make([]int, 0, capacity)
+		w.trunBuf[i] = make([]mp4.TrunEntry, 0, capacity)
+	}
+}
+
+func growSlice[T any](s []T, n int) []T {
+	if cap(s) >= n {
+		return s[:n]
+	}
+	capacity := max(n, max(defaultWriterTrackCapacity, cap(s)*2))
+	grown := make([]T, n, capacity)
+	copy(grown, s)
+	return grown
+}
+
+func (w *Writer) ensureMoofCapacity(trackCount, sampleCount int) {
+	// This bound covers every optional trun field and fixed box field emitted by
+	// prepare. It grows only when a larger fragment is first encountered.
+	need := 128 + trackCount*128 + sampleCount*20
+	if cap(w.buf) >= need {
+		return
+	}
+	w.buf = make([]byte, max(need, cap(w.buf)*2))
+}
+
 // WriteBodyRange writes the body bytes in [start, end) to dst, reading sample
 // bytes from src only for the portion of the window that overlaps the sample
 // data. Offsets are relative to the start of the body: the moof occupies
 // [0, moofSize), the 8-byte mdat header [moofSize, moofSize+8), and the sample
 // data the remainder up to [Writer.BodySize]. It must be called after
-// [Writer.Prepare]. start and end must satisfy 0 <= start <= end <= BodySize.
+// [Writer.Prepare] or [Writer.PrepareTrack]. start and end must satisfy
+// 0 <= start <= end <= BodySize.
 func (w *Writer) WriteBodyRange(dst io.Writer, src io.ReaderAt, start, end int64) error {
 	moofSize := int64(len(w.moof))
 

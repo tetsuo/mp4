@@ -1,6 +1,7 @@
 package fragment_test
 
 import (
+	"encoding/binary"
 	"io"
 	"os"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 )
 
 const testFile = "../test-data/big-buck-bunny-480p-30sec.mp4"
+const audioTestFile = "../test-data/aac-10s.mp4"
 
 func openTestFile(t testing.TB) *os.File {
 	t.Helper()
@@ -111,6 +113,113 @@ func TestReadFragments(t *testing.T) {
 	}
 
 	t.Logf("fragments=%d totalSamples=%d", fragCount, totalSamples)
+}
+
+func TestReadAudioOnlyFragments(t *testing.T) {
+	f, err := os.Open(audioTestFile)
+	if err != nil {
+		t.Skipf("test file not available: %v", err)
+	}
+	defer f.Close()
+	r, init, err := fragment.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if init.VideoTrack() != nil || init.AudioTrack() == nil {
+		t.Fatalf("audio-only tracks = %+v", init.Tracks)
+	}
+	if err := r.SetTargetDuration(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Seek(4); err != nil {
+		t.Fatal(err)
+	}
+	fr, err := r.ReadFragment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, ve := r.VideoRun()
+	as, ae := r.AudioRun()
+	if vs != 0 || ve != 0 || as <= 0 || ae <= as || len(fr.Samples) != ae-as {
+		t.Fatalf("video=[%d,%d) audio=[%d,%d) samples=%d", vs, ve, as, ae, len(fr.Samples))
+	}
+}
+
+// movieTimescale returns the mvhd timescale from an ftyp+moov or bare moov buffer.
+func movieTimescale(tb testing.TB, buf []byte) uint32 {
+	tb.Helper()
+	r := mp4.NewReader(buf)
+	for r.Next() {
+		if r.Type() != mp4.TypeMoov {
+			continue
+		}
+		r.Enter()
+		for r.Next() {
+			if r.Type() == mp4.TypeMvhd {
+				ts, _, _ := r.ReadMvhd()
+				return ts
+			}
+		}
+		r.Exit()
+	}
+	tb.Fatal("mvhd not found")
+	return 0
+}
+
+// TestInitSegmentCarriesSourceMovieTimescale overwrites the source movie
+// timescale with a distinctive value and checks the init segment's mvhd reports
+// it, proving the timescale comes from the source rather than a fixed constant.
+func TestInitSegmentCarriesSourceMovieTimescale(t *testing.T) {
+	data, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Skipf("test file not available: %v", err)
+	}
+
+	// The version-0 mvhd timescale sits after the 4-byte creation and
+	// modification times in the box data.
+	const wantTS = 90000
+	patched := false
+	r := mp4.NewReader(data)
+	for r.Next() && !patched {
+		if r.Type() != mp4.TypeMoov {
+			continue
+		}
+		r.Enter()
+		for r.Next() {
+			if r.Type() == mp4.TypeMvhd {
+				if r.Version() != 0 {
+					t.Skip("mvhd is not version 0")
+				}
+				off := r.DataOffset()
+				binary.BigEndian.PutUint32(data[off+8:off+12], wantTS)
+				patched = true
+				break
+			}
+		}
+		r.Exit()
+	}
+	if !patched {
+		t.Fatal("mvhd not found in source")
+	}
+
+	tmp, err := os.CreateTemp(t.TempDir(), "patched-*.mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	_, initSeg, err := fragment.NewReader(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := movieTimescale(t, initSeg.Bytes()); got != wantTS {
+		t.Errorf("init movie timescale = %d, want %d", got, wantTS)
+	}
 }
 
 func TestWriteFragment(t *testing.T) {
