@@ -1,6 +1,7 @@
 package fragment_test
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
@@ -219,6 +220,112 @@ func TestInitSegmentCarriesSourceMovieTimescale(t *testing.T) {
 	}
 	if got := movieTimescale(t, initSeg.Bytes()); got != wantTS {
 		t.Errorf("init movie timescale = %d, want %d", got, wantTS)
+	}
+}
+
+const keyframesEverySecondFile = "../test-data/h264-aac-10s-gop1.mp4"
+
+// trunFlagsForTrack walks a moof+mdat buffer and returns the tr_flags of the
+// trun in the traf whose tfhd names trackID.
+func trunFlagsForTrack(buf []byte, trackID uint32) (uint32, bool) {
+	r := mp4.NewReader(buf)
+	for r.Next() {
+		if r.Type() != mp4.TypeMoof {
+			continue
+		}
+		r.Enter()
+		for r.Next() {
+			if r.Type() != mp4.TypeTraf {
+				continue
+			}
+			r.Enter()
+			var tid, flags uint32
+			var haveTrun bool
+			for r.Next() {
+				switch r.Type() {
+				case mp4.TypeTfhd:
+					tid = r.ReadTfhd()
+				case mp4.TypeTrun:
+					flags = r.Flags()
+					haveTrun = true
+				}
+			}
+			r.Exit()
+			if haveTrun && tid == trackID {
+				return flags, true
+			}
+		}
+		r.Exit()
+	}
+	return 0, false
+}
+
+// videoTrunFlags packages the first fragment of path at the given target
+// duration and returns the video track's trun tr_flags.
+func videoTrunFlags(t *testing.T, path string, targetSec float64) uint32 {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Skipf("test file not available: %v", err)
+	}
+	defer f.Close()
+
+	frag, initSeg, err := fragment.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := frag.SetTargetDuration(targetSec); err != nil {
+		t.Fatal(err)
+	}
+	vt := initSeg.VideoTrack()
+	if vt == nil {
+		t.Fatal("no video track")
+	}
+
+	fr, err := frag.ReadFragment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := fragment.NewWriter(&buf)
+	if err := w.WriteInit(initSeg); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteFragment(fr, f); err != nil {
+		t.Fatal(err)
+	}
+
+	flags, ok := trunFlagsForTrack(buf.Bytes(), vt.ID)
+	if !ok {
+		t.Fatal("video trun not found in fragment")
+	}
+	return flags
+}
+
+// TestWriterSampleFlagsAdaptive locks the choice between per-sample trun flags
+// and the compact first-sample-flags entry. A segment that spans several
+// keyframes must carry per-sample flags; a segment holding only its leading
+// keyframe must use the first-sample-flags form.
+func TestWriterSampleFlagsAdaptive(t *testing.T) {
+	// One segment over the whole keyframe-every-second file holds many interior
+	// keyframes, so sync flags vary sample to sample and must be per-sample.
+	interior := videoTrunFlags(t, keyframesEverySecondFile, 3600)
+	if interior&mp4.TrunSampleFlagsPresent == 0 {
+		t.Errorf("interior-keyframe segment: tr_flags=%#06x, want TrunSampleFlagsPresent set", interior)
+	}
+	if interior&mp4.TrunFirstSampleFlagsPresent != 0 {
+		t.Errorf("interior-keyframe segment: tr_flags=%#06x, TrunFirstSampleFlagsPresent must not be set", interior)
+	}
+
+	// The first segment of a file whose next keyframe is far away holds a single
+	// keyframe, so only the first sample differs and the compact form is used.
+	single := videoTrunFlags(t, testFile, 1)
+	if single&mp4.TrunFirstSampleFlagsPresent == 0 {
+		t.Errorf("single-keyframe segment: tr_flags=%#06x, want TrunFirstSampleFlagsPresent set", single)
+	}
+	if single&mp4.TrunSampleFlagsPresent != 0 {
+		t.Errorf("single-keyframe segment: tr_flags=%#06x, TrunSampleFlagsPresent must not be set", single)
 	}
 }
 
