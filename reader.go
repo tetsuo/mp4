@@ -117,6 +117,12 @@ func (r *Reader) Next() bool {
 		return false
 	}
 
+	// A box cannot be smaller than the header already read; rejecting it keeps
+	// dataStart within boxEnd so Data never slices with a low bound past its high.
+	if r.boxEnd < ptr {
+		return false
+	}
+
 	// Parse full box header if applicable
 	if IsFullBox(r.boxType) {
 		if r.boxEnd-ptr < 4 {
@@ -212,6 +218,9 @@ func (r *Reader) Skip(n int) {
 // Used for boxes like stsd and dref that begin with a count field.
 func (r *Reader) EntryCount() uint32 {
 	data := r.Data()
+	if len(data) < 4 {
+		return 0
+	}
 	return be.Uint32(data[0:4])
 }
 
@@ -222,11 +231,17 @@ func (r *Reader) ReadMvhd() (timescale uint32, duration uint64, nextTrackId uint
 	version := r.Version()
 	if version == 1 {
 		// v1: ctime(8)+mtime(8)+timescale(4)+duration(8)+rate(4)+volume(2)+reserved(10)+matrix(36)+predefined(24)+nextTrackId(4) = 108
+		if len(data) < 108 {
+			return
+		}
 		timescale = be.Uint32(data[16:20])
 		duration = be.Uint64(data[20:28])
 		nextTrackId = be.Uint32(data[104:108])
 	} else {
 		// v0: ctime(4)+mtime(4)+timescale(4)+duration(4)+rate(4)+volume(2)+reserved(10)+matrix(36)+predefined(24)+nextTrackId(4) = 96
+		if len(data) < 96 {
+			return
+		}
 		timescale = be.Uint32(data[8:12])
 		duration = uint64(be.Uint32(data[12:16]))
 		nextTrackId = be.Uint32(data[92:96])
@@ -242,6 +257,9 @@ func (r *Reader) ReadTkhd() (trackId uint32, duration uint64, width, height uint
 	version := r.Version()
 	if version == 1 {
 		// v1: ctime(8)+mtime(8)+trackId(4)+reserved(4)+duration(8)
+		if len(data) < 92 {
+			return
+		}
 		trackId = be.Uint32(data[16:20])
 		duration = be.Uint64(data[24:32])
 		// +reserved(8)+layer(2)+altGroup(2)+volume(2)+reserved(2)+matrix(36)+width(4)+height(4)
@@ -249,6 +267,9 @@ func (r *Reader) ReadTkhd() (trackId uint32, duration uint64, width, height uint
 		height = be.Uint32(data[88:92])
 	} else {
 		// v0: ctime(4)+mtime(4)+trackId(4)+reserved(4)+duration(4)
+		if len(data) < 80 {
+			return
+		}
 		trackId = be.Uint32(data[8:12])
 		duration = uint64(be.Uint32(data[16:20]))
 		// +reserved(8)+layer(2)+altGroup(2)+volume(2)+reserved(2)+matrix(36)+width(4)+height(4)
@@ -265,11 +286,17 @@ func (r *Reader) ReadMdhd() (timescale uint32, duration uint64, language uint16)
 	version := r.Version()
 	if version == 1 {
 		// v1: ctime(8)+mtime(8)+timescale(4)+duration(8)+lang(2)+quality(2)
+		if len(data) < 30 {
+			return
+		}
 		timescale = be.Uint32(data[16:20])
 		duration = be.Uint64(data[20:28])
 		language = be.Uint16(data[28:30])
 	} else {
 		// v0: ctime(4)+mtime(4)+timescale(4)+duration(4)+lang(2)+quality(2)
+		if len(data) < 18 {
+			return
+		}
 		timescale = be.Uint32(data[8:12])
 		duration = uint64(be.Uint32(data[12:16]))
 		language = be.Uint16(data[16:18])
@@ -282,6 +309,9 @@ func (r *Reader) ReadMdhd() (timescale uint32, duration uint64, language uint16)
 func (r *Reader) ReadHdlr() [4]byte {
 	data := r.Data()
 	var t [4]byte
+	if len(data) < 8 {
+		return t
+	}
 	copy(t[:], data[4:8])
 	return t
 }
@@ -305,8 +335,14 @@ func (r *Reader) ReadMehd() (fragmentDuration uint64) {
 	data := r.Data()
 	version := r.Version()
 	if version == 1 {
+		if len(data) < 8 {
+			return
+		}
 		fragmentDuration = be.Uint64(data[0:8])
 	} else {
+		if len(data) < 4 {
+			return
+		}
 		fragmentDuration = uint64(be.Uint32(data[0:4]))
 	}
 	return
@@ -336,6 +372,9 @@ func (r *Reader) ReadElst() (mediaTime int64, ok bool) {
 // default sample size, and default sample flags.
 func (r *Reader) ReadTrex() (trackId, defSampleDescIdx, defSampleDuration, defSampleSize, defSampleFlags uint32) {
 	data := r.Data()
+	if len(data) < 20 {
+		return
+	}
 	trackId = be.Uint32(data[0:4])
 	defSampleDescIdx = be.Uint32(data[4:8])
 	defSampleDuration = be.Uint32(data[8:12])
@@ -347,6 +386,9 @@ func (r *Reader) ReadTrex() (trackId, defSampleDescIdx, defSampleDuration, defSa
 // ReadMfhd extracts the sequence number from an mfhd box.
 func (r *Reader) ReadMfhd() (sequenceNumber uint32) {
 	data := r.Data()
+	if len(data) < 4 {
+		return
+	}
 	sequenceNumber = be.Uint32(data[0:4])
 	return
 }
@@ -354,6 +396,9 @@ func (r *Reader) ReadMfhd() (sequenceNumber uint32) {
 // ReadTfhd extracts the track ID from a tfhd box.
 func (r *Reader) ReadTfhd() (trackId uint32) {
 	data := r.Data()
+	if len(data) < 4 {
+		return
+	}
 	trackId = be.Uint32(data[0:4])
 	return
 }
@@ -363,8 +408,14 @@ func (r *Reader) ReadTfdt() (baseMediaDecodeTime uint64) {
 	data := r.Data()
 	version := r.Version()
 	if version == 1 {
+		if len(data) < 8 {
+			return
+		}
 		baseMediaDecodeTime = be.Uint64(data[0:8])
 	} else {
+		if len(data) < 4 {
+			return
+		}
 		baseMediaDecodeTime = uint64(be.Uint32(data[0:4]))
 	}
 	return
