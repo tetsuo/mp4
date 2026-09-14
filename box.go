@@ -1,5 +1,5 @@
-// Package mp4 provides support for the ISO base media file format and
-// fragmented MP4 streams.
+// Package mp4 provides support for reading and writing ISO Base Media File Format
+// (ISOBMFF) files, commonly known as MP4.
 package mp4
 
 // BoxType is a 4-byte box type identifier.
