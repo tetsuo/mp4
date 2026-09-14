@@ -32,6 +32,19 @@ func NewStszIter(data []byte) StszIter {
 // Count returns the total number of samples.
 func (it *StszIter) Count() uint32 { return it.count }
 
+// ConstantSize reports whether the box encodes one size for every sample rather
+// than a per-sample size table.
+func (it *StszIter) ConstantSize() bool { return it.sampleSize != 0 }
+
+// SizeTableLen returns the number of per-sample size entries the box stores. It
+// is zero for the constant-size form.
+func (it *StszIter) SizeTableLen() int {
+	if it.sampleSize != 0 || len(it.buf) < 8 {
+		return 0
+	}
+	return (len(it.buf) - 8) / 4
+}
+
 // Next returns the next sample size. Returns (0, false) when done.
 func (it *StszIter) Next() (uint32, bool) {
 	if it.index >= it.count {

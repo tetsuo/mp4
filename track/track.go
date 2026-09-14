@@ -726,6 +726,12 @@ func childBox(mr *mp4.Reader, childOffset int, boxType mp4.BoxType) []byte {
 
 // parseSamples parses sample table data and populates track.Samples.
 // Returns an error if required sample table data is missing or corrupt.
+// maxSamples caps the sample count of a constant-size stsz, which carries no
+// per-sample data to bound it; a per-sample table is bounded by its own entries
+// instead. The cap keeps a malformed constant-size box from forcing a large
+// allocation while staying well above any real constant-size track.
+const maxSamples = 1 << 20
+
 func (t *Track) parseSamples() error {
 	if t.raw.stszData == nil || t.raw.sttsData == nil || t.raw.stscData == nil {
 		return fmt.Errorf("track %d: %w: missing required sample table data (stsz/stts/stsc)", t.ID, ErrInvalidTrack)
@@ -739,6 +745,18 @@ func (t *Track) parseSamples() error {
 	if numSamples == 0 {
 		t.Samples = t.Samples[:0]
 		return nil
+	}
+
+	// A malformed stsz can declare far more samples than the file describes,
+	// which would otherwise size the allocation below from an untrusted count. A
+	// per-sample size table cannot describe more samples than it stores; the
+	// constant-size form carries no per-sample data, so bound it at maxSamples.
+	if stszIt.ConstantSize() {
+		if numSamples > maxSamples {
+			return fmt.Errorf("track %d: %w: constant-size stsz declares %d samples", t.ID, ErrCorruptData, numSamples)
+		}
+	} else if numSamples > stszIt.SizeTableLen() {
+		return fmt.Errorf("track %d: %w: stsz declares %d samples but stores %d", t.ID, ErrCorruptData, numSamples, stszIt.SizeTableLen())
 	}
 
 	var samples []Sample
