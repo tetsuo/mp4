@@ -42,7 +42,7 @@ func BenchmarkParseTracks(b *testing.B) {
 			b.SetBytes(int64(len(moov)))
 			b.ReportAllocs()
 			for b.Loop() {
-				tracks, _, err := track.ParseTracks(moov)
+				tracks, _, _, err := track.ParseTracks(moov)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -62,7 +62,7 @@ func BenchmarkParseTracksAndCodec(b *testing.B) {
 			b.ReportAllocs()
 			var sink int
 			for b.Loop() {
-				tracks, _, err := track.ParseTracks(moov)
+				tracks, _, _, err := track.ParseTracks(moov)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -78,7 +78,7 @@ func BenchmarkParseTracksAndCodec(b *testing.B) {
 func BenchmarkCollectTrackSampleStats(b *testing.B) {
 	for _, path := range benchFiles {
 		moov := loadMoov(b, path)
-		tracks, _, err := track.ParseTracks(moov)
+		tracks, _, _, err := track.ParseTracks(moov)
 		if err != nil {
 			b.Fatal(err)
 		}

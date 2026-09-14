@@ -216,7 +216,7 @@ func (f *Reader) readInit() (*InitSegment, error) {
 		return nil, err
 	}
 
-	tracks, duration, err := track.ParseTracksInto(f.allTracks, moovBuf)
+	tracks, _, duration, err := track.ParseTracksInto(f.allTracks, moovBuf)
 	if err != nil {
 		return nil, err
 	}

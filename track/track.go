@@ -356,11 +356,12 @@ var (
 
 // ParseTracks parses a moov box buffer and returns the tracks found with
 // their samples fully populated. The moov buffer must include the box header
-// (the full top-level moov box). The movie duration (from mvhd) is also returned.
+// (the full top-level moov box). The movie timescale and duration (from mvhd)
+// are also returned.
 //
 // Returns an error if the moov box is not found, if no playable tracks are
 // found, or if sample tables cannot be parsed for any track.
-func ParseTracks(moovBuf []byte) ([]*Track, uint64, error) {
+func ParseTracks(moovBuf []byte) ([]*Track, uint32, uint64, error) {
 	return ParseTracksInto(nil, moovBuf)
 }
 
@@ -368,13 +369,14 @@ func ParseTracks(moovBuf []byte) ([]*Track, uint64, error) {
 // and their sample slices, which avoids most allocations when the new file has
 // the same shape as the previous one. Pass the slice returned by an earlier
 // call as dst. The tracks in dst must not be used after this call.
-func ParseTracksInto(dst []*Track, moovBuf []byte) ([]*Track, uint64, error) {
+func ParseTracksInto(dst []*Track, moovBuf []byte) ([]*Track, uint32, uint64, error) {
 	mr := mp4.NewReader(moovBuf)
 	if !mr.Next() || mr.Type() != mp4.TypeMoov {
-		return nil, 0, ErrMoovNotFound
+		return nil, 0, 0, ErrMoovNotFound
 	}
 
 	var tracks []*Track
+	var timescale uint32
 	var duration uint64
 	reused := 0
 
@@ -382,7 +384,8 @@ func ParseTracksInto(dst []*Track, moovBuf []byte) ([]*Track, uint64, error) {
 	for mr.Next() {
 		switch mr.Type() {
 		case mp4.TypeMvhd:
-			_, dur, _ := mr.ReadMvhd()
+			ts, dur, _ := mr.ReadMvhd()
+			timescale = ts
 			duration = dur
 		case mp4.TypeTrak:
 			var t *Track
@@ -416,7 +419,7 @@ func ParseTracksInto(dst []*Track, moovBuf []byte) ([]*Track, uint64, error) {
 		valid = append(valid, t)
 	}
 
-	return valid, duration, nil
+	return valid, timescale, duration, nil
 }
 
 // resetTrack clears t for reuse while keeping the backing array of its sample
