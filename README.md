@@ -1,6 +1,6 @@
 # mp4
 
-ISOBMFF/MP4 container library with fragmented MP4 support.
+ISO Base Media File Format (ISOBMFF).
 
 ## Usage
 
