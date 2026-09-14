@@ -299,6 +299,16 @@ func (s Sample) Size() uint32 { return s.size &^ syncBit }
 // IsSync reports whether the sample is a sync sample (keyframe).
 func (s Sample) IsSync() bool { return s.size&syncBit != 0 }
 
+// SetSize sets the sample's byte size and sync flag, which share one packed
+// field. It is how code that produces samples, rather than parsing them, fills
+// a Sample. The size must stay below the sync bit, 2 GiB.
+func (s *Sample) SetSize(size uint32, sync bool) {
+	s.size = size &^ syncBit
+	if sync {
+		s.size |= syncBit
+	}
+}
+
 // PTS returns the presentation timestamp.
 func (s Sample) PTS() int64 {
 	return s.DTS + int64(s.PresentationOffset)
